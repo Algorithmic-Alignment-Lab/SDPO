@@ -770,12 +770,15 @@ class RayPPOTrainer:
             for i in range(batch_size)
         ]
 
-        # self_distillation_mask is True if sample has a solution OR feedback is used (i.e., will get a reprompted message)
-        self_distillation_mask = torch.tensor(
-            [solution_strs[i] is not None or feedback_used[i] for i in range(batch_size)],
-            dtype=torch.float32,
-            device=device
-        )
+        # Every sample participates in self-distillation, regardless of whether the
+        # task's reward function marked it "successful". Reward is not a training
+        # signal in this loss (see compute_self_distillation_loss, which never takes
+        # advantages/reward as input) — it was previously only used to gate which
+        # samples got a demonstration-based reprompt, which conflates "did the
+        # reward function like this rollout" with "should this sample be distilled."
+        # Those are unrelated once the reward function is just a placeholder/proxy
+        # rather than the actual training objective.
+        self_distillation_mask = torch.ones(batch_size, dtype=torch.float32, device=device)
 
         uids = set(batch.non_tensor_batch["uid"])
         num_with_feedback_available = sum(1 for f in feedback_list if f is not None)
