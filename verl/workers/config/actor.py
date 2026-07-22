@@ -43,53 +43,31 @@ class SelfDistillationConfig(BaseConfig):
         Distillation is enabled when policy_loss.loss_mode == "sdpo".
         full_logit_distillation (bool): Whether to use full-logit KL distillation.
         alpha (float): KL interpolation coefficient. 0.0=forward KL, 1.0=reverse KL, in-between=JSD.
-        success_reward_threshold (float): Minimum sequence reward to be considered successful.
         teacher_regularization (str): Teacher regularization mode. Options: "ema", "trust-region".
         teacher_update_rate (float): EMA update rate for teacher weights, or trust-region mixing coefficient.
         distillation_topk (Optional[int]): If set, use top-k logits for distillation.
         distillation_add_tail (bool): Whether to add a tail bucket for top-k distillation.
         max_reprompt_len (int): Maximum length of the reprompted prompt.
         reprompt_truncation (str): Truncation method for the reprompted prompt (recommended to use "right" or "error").
-        dont_reprompt_on_self_success (bool): Whether to not reprompt on self-success.
-        remove_thinking_from_demonstration (bool): Whether to remove <think>...</think> tags from successful demonstrations before reprompting.
         is_clip (Optional[float]): Clip value for distillation IS ratio; None disables IS weighting.
-        reprompt_template (str): Template for reprompting. Uses {prompt}, {solution}, {feedback} placeholders.
-        solution_template (str): Template for formatting solution section. Uses {successful_previous_attempt} placeholder.
-        feedback_template (str): Template for formatting feedback section. Uses {feedback_raw} placeholder.
-        include_environment_feedback (bool): Whether to include environment feedback in reprompting for wrong attempts.
-        environment_feedback_only_without_solution (bool): If True, only use feedback when no solution is available (ignore feedback when solution exists).
-        reprompt_template_feedback (str): Template for reprompting with feedback but no solution.
-        reprompt_template_feedback_solution (str): Template for reprompting with both feedback and solution.
+        goal_context_template (str): Template for the teacher reprompt. Uses {prompt}, {goal_context} placeholders;
+            {goal_context} is GOOD's format_goals_for_context(state) output, empty string if no goals inferred yet.
+        good_contexts_path (str): Path to the precomputed {"conversation_id:turn_index": goal_context} JSON lookup
+            written by data/precompute_good_contexts.py, loaded by the GOOD state cache actor. Required when
+            policy_loss.loss_mode == "sdpo".
     """
 
     full_logit_distillation: bool = True
     alpha: float = 0.0
-    success_reward_threshold: float = 1.0
     teacher_regularization: str = "ema"
     teacher_update_rate: float = 0.05
     distillation_topk: Optional[int] = None
     distillation_add_tail: bool = True
     max_reprompt_len: int = 10240
     reprompt_truncation: str = "right"
-    dont_reprompt_on_self_success: bool = False
-    remove_thinking_from_demonstration: bool = False
     is_clip: Optional[float] = None
-    reprompt_template: str = (
-        "{prompt}{solution}{feedback}\n\n"
-        "Correctly solve the original question.\n"
-    )
-    solution_template: str = (
-        "\n"
-        "Correct solution:\n\n"
-        "{successful_previous_attempt}\n\n"
-    )
-    feedback_template: str = (
-        "\n"
-        "The following is feedback from your unsuccessful earlier attempt:\n\n"
-        "{feedback_raw}\n\n"
-    )
-    include_environment_feedback: bool = False
-    environment_feedback_only_without_solution: bool = False
+    good_contexts_path: str = ""
+    goal_context_template: str = "{prompt}\n\n{goal_context}"
 
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:

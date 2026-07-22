@@ -93,16 +93,13 @@ self_distillation:
   distillation_add_tail: True
 
   # KL interpolation coefficient: 0.0=forward KL, 1.0=reverse KL, in-between=JSD
-  alpha: 0.5 
-
-  # Minimum sequence reward to be considered successful
-  success_reward_threshold: 0.5
+  alpha: 0.5
 
   # Teacher regularization method: "ema" or "trust-region"
   teacher_regularization: ema
 
   # EMA update rate for teacher weights, or trust-region mixing coefficient
-  teacher_update_rate: 0.05 
+  teacher_update_rate: 0.05
 
   # Maximum length of the reprompted prompt
   max_reprompt_len: 10240
@@ -110,42 +107,19 @@ self_distillation:
   # Truncation method for the reprompted prompt (recommended to use "right" or "error")
   reprompt_truncation: right # "left", "right", "error"
 
-  # Whether to not reprompt on self-success
-  dont_reprompt_on_self_success: True
-
-  # Whether to remove <think>...</think> tags from successful demonstrations before reprompting
-  remove_thinking_from_demonstration: True
-
-  # Whether to include environment feedback in reprompting for wrong attempts
-  # If True and feedback exists: use reprompt_template_feedback_solution (with solution) or reprompt_template_feedback (without solution)
-  include_environment_feedback: True
-
-  # If True, only use feedback when no solution is available (ignore feedback when solution exists)
-  # Requires include_environment_feedback=True to have any effect
-  environment_feedback_only_without_solution: True
-
   # IS clip for loss; null disables IS weighting
   is_clip: 2
 
-  # Reprompting template - available variables: prompt, successful_previous_attempt, feedback
-  reprompt_template: |-
-    {prompt}{solution}{feedback}
+  # Path to the precomputed {"conversation_id:turn_index": goal_context} JSON lookup
+  # written by data/precompute_good_contexts.py. Required when loss_mode == "sdpo".
+  good_contexts_path: ""
 
-    Correctly solve the original question.
+  # Teacher reprompt template - available variables: prompt, goal_context (GOOD's
+  # format_goals_for_context(state) output; empty string if no goals inferred yet)
+  goal_context_template: |-
+    {prompt}
 
-  # Solution template - available variables: successful_previous_attempt
-  solution_template: |-
-
-    Correct solution:
-
-    {successful_previous_attempt}
-
-  # Feedback template - available variables: feedback_raw
-  feedback_template: |-
-
-    The following is feedback from your unsuccessful earlier attempt:
-
-    {feedback_raw}
+    {goal_context}
 
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
