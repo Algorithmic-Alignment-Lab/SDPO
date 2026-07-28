@@ -43,7 +43,10 @@ class SelfDistillationConfig(BaseConfig):
         Distillation is enabled when policy_loss.loss_mode == "sdpo".
         full_logit_distillation (bool): Whether to use full-logit KL distillation.
         alpha (float): KL interpolation coefficient. 0.0=forward KL, 1.0=reverse KL, in-between=JSD.
-        teacher_regularization (str): Teacher regularization mode. Options: "ema", "trust-region".
+        teacher_regularization (str): Teacher regularization mode. Options: "ema", "trust-region",
+            "frozen-base". "frozen-base" is for LoRA runs: the teacher is the student with its
+            adapters disabled, so no second copy of the model is allocated and teacher_update_rate
+            is ignored (there is nothing to update). Requires model.lora_rank > 0.
         teacher_update_rate (float): EMA update rate for teacher weights, or trust-region mixing coefficient.
         distillation_topk (Optional[int]): If set, use top-k logits for distillation.
         distillation_add_tail (bool): Whether to add a tail bucket for top-k distillation.
@@ -72,7 +75,7 @@ class SelfDistillationConfig(BaseConfig):
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:
             raise ValueError(f"self_distillation.alpha must be in [0,1], got {self.alpha}")
-        valid_teacher_regularization = ["ema", "trust-region"]
+        valid_teacher_regularization = ["ema", "trust-region", "frozen-base"]
         if self.teacher_regularization not in valid_teacher_regularization:
             raise ValueError(
                 "self_distillation.teacher_regularization must be one of "

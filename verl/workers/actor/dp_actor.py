@@ -64,6 +64,45 @@ class TrustRegionTeacher(nn.Module):
         return SimpleNamespace(logits=logits)
 
 
+class LoRADisabledTeacher(nn.Module):
+    """SDPO teacher for LoRA runs: the student with its adapters switched off.
+
+    The "ema" and "trust-region" teachers both need a second full copy of the model
+    (`ref_module_fsdp`), which is fine at 8B but defeats the entire point of LoRA at
+    32B -- the frozen base weights would be resident twice. Since a LoRA student *is*
+    the frozen base plus a small adapter, the base is already in memory and running it
+    with the adapter disabled costs nothing extra.
+
+    Semantically this makes the teacher a fixed pretrained model reading the
+    goal-augmented prompt, while the student learns to match it without the prompt.
+    That is standard context distillation with a frozen teacher; the EMA/trust-region
+    teachers are stabilizers on top of that idea, not the idea itself.
+
+    Same contract as TrustRegionTeacher: takes whatever _forward_micro_batch passes to
+    a model and returns an object exposing `.logits`. verl already uses this
+    adapter-disabled-base trick for the reference policy in
+    `FSDPWorker.compute_log_prob` (`fsdp_workers.py`), so the pattern is established.
+    """
+
+    def __init__(self, student_module: nn.Module) -> None:
+        super().__init__()
+        # Deliberately shares storage with the actor: there is nothing to copy, and
+        # nothing here is ever trained (SDPO only ever runs this under torch.no_grad).
+        self.base_module = student_module
+
+    @property
+    def config(self):
+        # _forward_micro_batch reaches for `model.config` on the ulysses-SP path.
+        inner = getattr(self.base_module, "module", self.base_module)
+        return inner.config
+
+    def forward(self, *args, **kwargs):
+        with self.base_module.disable_adapter():
+            out = self.base_module(*args, **kwargs)
+        logits = out.logits if hasattr(out, "logits") else out[0]
+        return SimpleNamespace(logits=logits)
+
+
 class DataParallelPPOActor(BasePPOActor):
     """FSDP DataParallel PPO Actor or Ref worker
 
