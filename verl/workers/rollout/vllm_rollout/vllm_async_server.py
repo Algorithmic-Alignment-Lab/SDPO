@@ -202,7 +202,22 @@ class vLLMHttpServer:
 
         self.config: RolloutConfig = omega_conf_to_dataclass(config)
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
-        self.config.max_model_len = get_max_position_embeddings(self.model_config.hf_config)
+        # Respect an explicitly configured rollout.max_model_len instead of always taking the
+        # model's full context. vLLM reserves KV cache for one request at max_model_len and
+        # refuses to start if the memory left after weights cannot cover it -- at 32B that is
+        # 5.00 GiB needed vs 4.17 GiB available, and lowering gpu_memory_utilization to buy
+        # training headroom only makes it worse, so the two knobs deadlock with no way out.
+        # Clobbering here made rollout.max_model_len silently inert (the override appeared in
+        # the Hydra override list while vLLM still reported max seq len 40960).
+        _max_pos = get_max_position_embeddings(self.model_config.hf_config)
+        if self.config.max_model_len is None:
+            self.config.max_model_len = _max_pos
+        elif self.config.max_model_len > _max_pos:
+            logger.warning(
+                f"rollout.max_model_len={self.config.max_model_len} exceeds the model's "
+                f"max_position_embeddings={_max_pos}; clamping."
+            )
+            self.config.max_model_len = _max_pos
         self.rollout_mode = rollout_mode
         self.workers = workers
 
