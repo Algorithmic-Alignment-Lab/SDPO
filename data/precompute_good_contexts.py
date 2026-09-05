@@ -190,6 +190,14 @@ def main():
     parser.add_argument("--chat_model", default="qwen3-32b")
     parser.add_argument("--embed_base_url", default="http://localhost:8001/v1")
     parser.add_argument("--embed_model", default="qwen3-embedding-8b")
+    parser.add_argument(
+        "--comparison_leader_weight",
+        type=float,
+        default=0.0,
+        help="Extra pairwise-comparison sampling weight for sets with a high current mean "
+        "win-rate, on top of the existing low-evidence preference (see GOODConfig's "
+        "docstring). Default 0.0 reproduces today's evidence-only weighting exactly.",
+    )
     args = parser.parse_args()
 
     trace_enabled = args.trace_dir is not None
@@ -223,6 +231,7 @@ def main():
     config = GOODConfig()
     config.diverse_fresh_proposals = args.proposer == "new"
     config.randomize_comparison_order = args.randomize_comparison_order == "on"
+    config.comparison_leader_weight = args.comparison_leader_weight
 
     # Resume: each conversation is written atomically (all its turns at once) after
     # it finishes, so any conversation_id already present in the output file is fully
