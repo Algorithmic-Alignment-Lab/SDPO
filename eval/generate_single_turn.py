@@ -289,6 +289,9 @@ def row_key(row: dict) -> str:
     return f"{row['conversation_id']}:{row['turn_index']}:{row['arm']}:{row['mode']}:{row['sample']}"
 
 
+SERVED_MODEL_OVERRIDE = None
+
+
 async def generate_one(client: httpx.AsyncClient, item: dict, endpoints: dict,
                        max_tokens: dict[str, int], sem: asyncio.Semaphore,
                        timeout: float, max_model_len: int | None = None) -> dict:
@@ -298,7 +301,11 @@ async def generate_one(client: httpx.AsyncClient, item: dict, endpoints: dict,
     base_url = endpoints[item["model"]].rstrip("/")
 
     payload = {
-        "model": item["model"],
+        # --served-model overrides the payload name: arm->model names like "vanilla" are
+        # aliases from the dedicated eval servers (--served-model-name vanilla); a shared
+        # server that only knows its real name 404s on them (vLLM returns HTTP 404 for an
+        # unknown model). URL routing still uses item["model"] via the endpoints map.
+        "model": SERVED_MODEL_OVERRIDE or item["model"],
         "messages": item["messages"],
         "max_tokens": max_tokens[mode],
         # Seeded per (arm, mode, item, sample) so reruns reproduce and the vanilla-vs-vanilla
@@ -444,6 +451,8 @@ def main():
     ap.add_argument("--conversations", required=True)
     ap.add_argument("--goal_contexts", required=True)
     ap.add_argument("--endpoints", required=True)
+    ap.add_argument("--served_model", default=None,
+                    help="payload model name override (shared servers without arm aliases)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--arms", default=",".join(DEFAULT_ARMS))
     ap.add_argument("--extra_arms", default="",
@@ -499,6 +508,8 @@ def main():
         conversations = {k: conversations[k] for k in keep}
     contexts = json.load(open(args.goal_contexts))
 
+    global SERVED_MODEL_OVERRIDE
+    SERVED_MODEL_OVERRIDE = args.served_model
     endpoints_blob = json.load(open(args.endpoints))
     endpoints = endpoints_blob["model_endpoints"]
     needed = {ARMS[a][0] for a in arms}
