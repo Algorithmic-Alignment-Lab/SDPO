@@ -23,7 +23,10 @@ garbage. We disable it per-request via chat_template_kwargs={"enable_thinking":
 False}, which vLLM's OpenAI server forwards to the chat template.
 """
 
+from __future__ import annotations  # keeps `list | None` annotations lazy on pre-3.10
+
 import asyncio
+import sys
 
 import httpx
 
@@ -52,6 +55,26 @@ class VLLMProvider:
         self.timeout = timeout
         self.enable_thinking = enable_thinking
 
+        # Failure accounting. THIS EXISTS BECAUSE ITS ABSENCE HID A REAL PROBLEM.
+        # `batch_complete`/`batch_embed` gather with return_exceptions=True and map failures to ""
+        # so one bad request cannot abort a whole conversation. That is the right resilience
+        # choice, but it made a systematic failure *invisible*.
+        #
+        # What is ESTABLISHED: during the 1k-pool 235B annotation, 377 requests were rejected with
+        # "maximum context length is 16384 tokens" (reported message sizes 15k-49.7k). Any of those
+        # that arrived through a batch_* call returned "" silently, and the affected turn's goal
+        # state is therefore STALE rather than empty, with nothing in the output marking it.
+        #
+        # What is NOT established: which call type produced those prompts, and which turns were hit.
+        # Every measurable component is far too small to explain them -- transcripts max at 8547
+        # tokens, individual goal lines at 444 chars, the full 10-set goal distribution at ~11k
+        # chars (~3k tokens). Do NOT propagate a mechanism story for this without new evidence; an
+        # earlier guess ("transcripts too long", "~2% of turns") was checked and proved wrong.
+        # The payload dump in _record_batch_failures is how the next occurrence gets identified.
+        self.batch_requests = 0
+        self.batch_failures = 0
+        self.context_length_failures = 0
+
     def _chat_payload(self, messages: list[dict], temperature: float, max_tokens: int) -> dict:
         return {
             "model": self.chat_model,
@@ -62,6 +85,70 @@ class VLLMProvider:
             # Qwen3 reasoning so short-max_tokens comparison calls return a bare
             # answer instead of a truncated <think> block.
             "chat_template_kwargs": {"enable_thinking": self.enable_thinking},
+        }
+
+    @staticmethod
+    def _is_context_length_error(exc: BaseException) -> bool:
+        """Is this a 400 caused by the prompt exceeding the server's --max-model-len?
+
+        Worth singling out: unlike a transient network error, this one is *deterministic* and
+        silently degrades output quality for exactly the longest, most goal-rich conversations.
+        """
+        if isinstance(exc, httpx.HTTPStatusError):
+            if exc.response is not None and exc.response.status_code == 400:
+                try:
+                    return "maximum context length" in exc.response.text
+                except Exception:  # noqa: BLE001 - response body may not be readable
+                    return False
+        return False
+
+    def _record_batch_failures(self, kind: str, results: list, total: int,
+                               payloads: list | None = None) -> None:
+        """Count failures and, on a context-length rejection, DUMP ENOUGH TO IDENTIFY THE PROMPT.
+
+        The payload dump is not decoration. During the 1k-pool annotation, 377 requests were
+        rejected for exceeding 16384 tokens with message sizes reported as 15k-49.7k -- yet every
+        component we can measure after the fact is far too small to explain that: transcripts max
+        at 8547 tokens, individual goal lines at 444 chars, and the full 10-set goal distribution
+        at ~11k chars (~3k tokens). vLLM rejects an over-long request before scheduling, so its log
+        never records the prompt content, and the cause remains UNIDENTIFIED. Logging the failing
+        payload's size and head here makes the next occurrence self-diagnosing instead of another
+        round of inference.
+        """
+        errors = [(i, r) for i, r in enumerate(results) if isinstance(r, BaseException)]
+        self.batch_requests += total
+        if not errors:
+            return
+        ctx_idx = [i for i, e in errors if self._is_context_length_error(e)]
+        self.batch_failures += len(errors)
+        self.context_length_failures += len(ctx_idx)
+
+        detail = f"{len(errors)}/{total} requests failed"
+        if ctx_idx:
+            detail += (f"; {len(ctx_idx)} exceeded the server's max context length -- those calls "
+                       f"return NOTHING, so the affected turn's goal state is STALE, not empty")
+        example = next((repr(e)[:200] for _, e in errors), "")
+        print(f"WARNING VLLMProvider.{kind}: {detail}. Substituting empty results. "
+              f"first error: {example}", file=sys.stderr, flush=True)
+
+        # Characterise the oversized payloads so the cause is identifiable next time.
+        if ctx_idx and payloads:
+            for i in ctx_idx[:2]:
+                if i >= len(payloads):
+                    continue
+                p = payloads[i]
+                text = ("".join(m.get("content") or "" for m in p)
+                        if isinstance(p, list) else str(p))
+                print(f"  OVERSIZED PAYLOAD [{kind} idx {i}]: {len(text)} chars "
+                      f"(~{len(text)//4} tokens est). head: {text[:300]!r} ... "
+                      f"tail: {text[-300:]!r}", file=sys.stderr, flush=True)
+
+    def failure_summary(self) -> dict:
+        """Call at the end of a run and LOG IT -- silent zeros are the point of this."""
+        return {
+            "batch_requests": self.batch_requests,
+            "batch_failures": self.batch_failures,
+            "context_length_failures": self.context_length_failures,
         }
 
     def complete(self, messages: list[dict], temperature: float = 0.0, max_tokens: int = 2048) -> str:
@@ -90,6 +177,7 @@ class VLLMProvider:
                 return await asyncio.gather(*(one(m) for m in messages_list), return_exceptions=True)
 
         results = asyncio.run(run_batch())
+        self._record_batch_failures("batch_complete", results, len(messages_list), messages_list)
         return [r if isinstance(r, str) else "" for r in results]
 
     def embed(self, text: str) -> list[float]:
@@ -116,4 +204,5 @@ class VLLMProvider:
                 return await asyncio.gather(*(one(t) for t in texts), return_exceptions=True)
 
         results = asyncio.run(run_batch())
+        self._record_batch_failures("batch_embed", results, len(texts), texts)
         return [r if isinstance(r, list) else [] for r in results]

@@ -59,6 +59,7 @@ from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, shou
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.good_state_cache import get_good_state_cache
+from verl.utils.good_teacher_prompt import build_teacher_messages
 from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.metric import reduce_metrics
@@ -628,7 +629,6 @@ class RayPPOTrainer:
         device = batch.batch["input_ids"].device
         response_mask = batch.batch["response_mask"]
         responses = batch.batch["responses"]
-        prompt_texts = [msgs[-1]["content"] for msgs in batch.non_tensor_batch["raw_prompt"]]
         batch_size = batch.batch.batch_size[0]
 
         # The teacher's reprompt is the same prompt the student saw, plus GOOD's
@@ -647,23 +647,19 @@ class RayPPOTrainer:
         ]
         goal_contexts = ray.get(goal_context_refs)
 
-        def _build_teacher_message(i: int) -> list[dict]:
-            system_messages = batch.non_tensor_batch["raw_prompt"][i][:-1]
-            if goal_contexts[i]:
-                reprompt_text = self_distillation_cfg.goal_context_template.format(
-                    prompt=prompt_texts[i],
-                    goal_context=goal_contexts[i],
-                )
-            else:
-                # No goals inferred yet (e.g. turn 1 of a conversation) -- teacher
-                # reprompt degenerates to the bare prompt, a near-no-op distillation
-                # step for that one sample. Expected, not a bug.
-                reprompt_text = prompt_texts[i]
-            return system_messages + [
-                {"role": "user", "content": reprompt_text},
-            ]
-
-        messages = [_build_teacher_message(i) for i in range(batch_size)]
+        # Built by verl/utils/good_teacher_prompt.py, which the eval harness imports too --
+        # the `prompted` eval arm IS this teacher, so duplicating the construction would let
+        # the two drift and silently compare against the wrong thing. An empty goal_context
+        # (e.g. turn 1, no goals inferred yet) degenerates to the bare prompt in there, which
+        # is expected rather than a bug.
+        messages = [
+            build_teacher_messages(
+                batch.non_tensor_batch["raw_prompt"][i],
+                goal_contexts[i],
+                self_distillation_cfg.goal_context_template,
+            )
+            for i in range(batch_size)
+        ]
         enable_thinking = self.config.data.apply_chat_template_kwargs.get("enable_thinking", True) if self.config.data.apply_chat_template_kwargs else True
         teacher_prompt = self.tokenizer.apply_chat_template(
             messages,
