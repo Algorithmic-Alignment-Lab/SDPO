@@ -779,7 +779,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
         from verl.workers.actor import DataParallelPPOActor
-        from verl.workers.actor.dp_actor import TrustRegionTeacher
+        from verl.workers.actor.dp_actor import LoRADisabledTeacher, TrustRegionTeacher
 
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
@@ -849,7 +849,31 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_rollout:
             self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
 
-        if self._is_ref:
+        # --- SDPO teacher selection -------------------------------------------------
+        # `_is_ref` is role-based (role == "actor_rollout_ref"), not gated on LoRA, so
+        # without this a LoRA run would still allocate a full second copy of the model as
+        # the teacher -- exactly the memory LoRA exists to avoid. With
+        # teacher_regularization="frozen-base" the teacher is the student's own frozen
+        # base with adapters disabled, so the ref build is skipped entirely.
+        _sd_cfg = self.config.actor.get("self_distillation", None) if self._is_actor else None
+        _is_sdpo = _sd_cfg is not None and self.config.actor.policy_loss.get("loss_mode", "vanilla") == "sdpo"
+        _teacher_reg = _sd_cfg.get("teacher_regularization", "ema") if _sd_cfg is not None else "ema"
+        use_frozen_base_teacher = _is_sdpo and _teacher_reg == "frozen-base"
+
+        if use_frozen_base_teacher and not self._is_lora:
+            raise ValueError(
+                "self_distillation.teacher_regularization='frozen-base' requires LoRA "
+                "(model.lora_rank > 0): with full-weight training there is no adapter to "
+                "disable, so the teacher would be identical to the student."
+            )
+        if self._is_lora and _is_sdpo and _teacher_reg != "frozen-base":
+            raise ValueError(
+                f"model.lora_rank > 0 with self_distillation.teacher_regularization='{_teacher_reg}' "
+                "would allocate a second full copy of the model as the teacher, defeating LoRA. "
+                "Set actor_rollout_ref.actor.self_distillation.teacher_regularization=frozen-base."
+            )
+
+        if self._is_ref and not use_frozen_base_teacher:
             ref_model_path = self.config.model.path
             ref_model = self.config.ref.get("model", None)
             if ref_model is not None:
@@ -903,6 +927,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                         )
                     else:
                         self.actor.teacher_module = self.ref_module_fsdp
+
+        if use_frozen_base_teacher:
+            self.actor.teacher_module = LoRADisabledTeacher(self.actor_module_fsdp)
+            if self.rank == 0:
+                print("SDPO teacher: LoRADisabledTeacher (adapter-disabled base; no ref model built)")
 
         if self._is_actor:
             self.flops_counter = FlopsCounter(self.actor_model_config)

@@ -20,7 +20,6 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
-import re
 import time
 import uuid
 from collections import defaultdict
@@ -59,6 +58,8 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
+from verl.utils.good_state_cache import get_good_state_cache
+from verl.utils.good_teacher_prompt import build_teacher_messages
 from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.metric import reduce_metrics
@@ -373,6 +374,15 @@ class RayPPOTrainer:
         self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
         self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
 
+        self_distillation_cfg = self.config.actor_rollout_ref.actor.get("self_distillation", None)
+        loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
+        if self_distillation_cfg is not None and loss_mode == "sdpo":
+            assert self_distillation_cfg.good_contexts_path, (
+                "actor_rollout_ref.actor.self_distillation.good_contexts_path is required "
+                "when policy_loss.loss_mode == 'sdpo'"
+            )
+            self.good_state_cache = get_good_state_cache(self_distillation_cfg.good_contexts_path)
+
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
@@ -607,73 +617,9 @@ class RayPPOTrainer:
                 reward_tensor = reward_tensor.sum(dim=-1)
             return reward_tensor, reward_extra_infos_dict
 
-    @staticmethod
-    def _collect_feedback(
-        include_environment_feedback: bool,
-        reward_extra_infos_dict: Optional[dict[str, Any]],
-        batch_size: int
-    ) -> list[Any]:
-        """
-        Collect environment feedback from reward_extra_infos_dict.
-
-        Args:
-            include_environment_feedback: Whether to include environment feedback
-            reward_extra_infos_dict: Dictionary containing reward extra information
-            batch_size: Size of the batch
-
-        Returns:
-            List of feedback strings (or None for entries without feedback)
-        """
-        feedback_list: list[Any] = [None] * batch_size
-        if include_environment_feedback and reward_extra_infos_dict is not None:
-            raw_feedback = reward_extra_infos_dict.get("feedback", [])
-            for i in range(min(len(raw_feedback), batch_size)):
-                # Only include non-empty feedback strings
-                if raw_feedback[i] and isinstance(raw_feedback[i], str) and raw_feedback[i].strip():
-                    feedback_list[i] = raw_feedback[i]
-        return feedback_list
-
-    def _collect_solutions_by_uid(self, batch: DataProto, reward_tensor: torch.Tensor, success_reward_threshold: float) -> dict[Any, list[int]]:
-        seq_scores = reward_tensor.sum(dim=-1).detach().cpu().numpy()
-        uids = batch.non_tensor_batch["uid"]
-        success_by_uid: dict[Any, list[int]] = defaultdict(list)
-        for idx, uid in enumerate(uids):
-            if seq_scores[idx] >= success_reward_threshold:
-                success_by_uid[uid].append(idx)
-        return success_by_uid
-
-    @staticmethod
-    def _remove_thinking_trace(text: str) -> str:
-        """Remove <think>...</think> tags and their content from text."""
-        return re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL)
-
-    def _get_solution(
-        self,
-        idx: int,
-        success_by_uid: dict[Any, list[int]],
-        uids: list[Any],
-        response_texts: list[str],
-        dont_reprompt_on_self_success: bool = False,
-        remove_thinking_from_demonstration: bool = False,
-    ) -> Optional[str]:
-        uid = uids[idx]
-        solution_idxs = success_by_uid[uid]
-        if dont_reprompt_on_self_success:
-            solution_idxs = [j for j in solution_idxs if j != idx]
-        if len(solution_idxs) == 0:
-            return None
-        solution_idx = solution_idxs[0]  # taking the first successful demonstration effectively selects a random one
-        solution_str = response_texts[solution_idx]
-        if remove_thinking_from_demonstration:
-            solution_str = self._remove_thinking_trace(solution_str)
-        return solution_str
-
-
     def _maybe_build_self_distillation_batch(
         self,
         batch: DataProto,
-        reward_tensor: torch.Tensor,
-        reward_extra_infos_dict: Optional[dict[str, list]] = None,
     ) -> Optional[tuple[DataProto, dict[str, float]]]:
         self_distillation_cfg = self.config.actor_rollout_ref.actor.get("self_distillation", None)
         loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
@@ -683,69 +629,37 @@ class RayPPOTrainer:
         device = batch.batch["input_ids"].device
         response_mask = batch.batch["response_mask"]
         responses = batch.batch["responses"]
-        response_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in responses]
-        prompt_texts = [msgs[-1]["content"] for msgs in batch.non_tensor_batch["raw_prompt"]]
         batch_size = batch.batch.batch_size[0]
 
-        # Extract feedback if available and include_environment_feedback is enabled
-        feedback_list = self._collect_feedback(
-            include_environment_feedback=self_distillation_cfg.include_environment_feedback,
-            reward_extra_infos_dict=reward_extra_infos_dict,
-            batch_size=batch_size,
-        )
-
-        success_by_uid = self._collect_solutions_by_uid(batch, reward_tensor, success_reward_threshold=self_distillation_cfg.success_reward_threshold)
-        solution_strs = [
-            self._get_solution(
-                i,
-                success_by_uid,
-                batch.non_tensor_batch["uid"],
-                response_texts,
-                self_distillation_cfg.dont_reprompt_on_self_success,
-                self_distillation_cfg.get("remove_thinking_from_demonstration", False),
+        # The teacher's reprompt is the same prompt the student saw, plus GOOD's
+        # goal-tracking context for this exact (conversation, turn). GOOD state is
+        # computed OFFLINE per conversation (see data/precompute_good_contexts.py --
+        # its confidence tracking decays/re-ranks hypotheses turn over turn, so it
+        # must be walked in order, not per-example) and served here as an O(1)
+        # lookup from a read-only detached Ray actor (verl/utils/good_state_cache.py):
+        # no OpenRouter calls, no good_goals dependency at training time.
+        extra_infos = batch.non_tensor_batch["extra_info"]
+        goal_context_refs = [
+            self.good_state_cache.get_goal_context.remote(
+                extra_infos[i]["conversation_id"], extra_infos[i]["turn_index"]
             )
             for i in range(batch_size)
         ]
+        goal_contexts = ray.get(goal_context_refs)
 
-        def _build_teacher_message(i: int) -> list[dict]:
-            system_messages = batch.non_tensor_batch["raw_prompt"][i][:-1]
-            has_solution = solution_strs[i] is not None
-            has_feedback = feedback_list[i] is not None
-            feedback_only_without_solution = self_distillation_cfg.get("environment_feedback_only_without_solution", False)
-
-            # If feedback_only_without_solution is True, only use feedback when no solution exists
-            use_feedback = has_feedback and (not feedback_only_without_solution or not has_solution)
-
-            # build solution section
-            solution_section = ""
-            if has_solution:
-                solution_section = self_distillation_cfg.solution_template.format(
-                    successful_previous_attempt=solution_strs[i]
-                )
-
-            # build feedback section
-            feedback_section = ""
-            if use_feedback:
-                feedback_section = self_distillation_cfg.feedback_template.format(
-                    feedback_raw=feedback_list[i]
-                )
-
-            # combine solution and feedback sections
-            if use_feedback or has_solution:
-                reprompt_text = self_distillation_cfg.reprompt_template.format(
-                    prompt=prompt_texts[i],
-                    solution=solution_section,
-                    feedback=feedback_section,
-                )
-            else:
-                reprompt_text = prompt_texts[i]
-
-            return system_messages + [
-                {"role": "user", "content": reprompt_text},
-            ]
-
-
-        messages = [_build_teacher_message(i) for i in range(batch_size)]
+        # Built by verl/utils/good_teacher_prompt.py, which the eval harness imports too --
+        # the `prompted` eval arm IS this teacher, so duplicating the construction would let
+        # the two drift and silently compare against the wrong thing. An empty goal_context
+        # (e.g. turn 1, no goals inferred yet) degenerates to the bare prompt in there, which
+        # is expected rather than a bug.
+        messages = [
+            build_teacher_messages(
+                batch.non_tensor_batch["raw_prompt"][i],
+                goal_contexts[i],
+                self_distillation_cfg.goal_context_template,
+            )
+            for i in range(batch_size)
+        ]
         enable_thinking = self.config.data.apply_chat_template_kwargs.get("enable_thinking", True) if self.config.data.apply_chat_template_kwargs else True
         teacher_prompt = self.tokenizer.apply_chat_template(
             messages,
@@ -763,29 +677,15 @@ class RayPPOTrainer:
         teacher_attention_mask = torch.cat([teacher_prompt["attention_mask"].to(device), response_mask], dim=1)
         teacher_position_ids = compute_position_id_with_mask(teacher_attention_mask)
 
-        # Compute which samples actually use feedback (accounting for environment_feedback_only_without_solution)
-        feedback_only_without_solution = self_distillation_cfg.get("environment_feedback_only_without_solution", False)
-        feedback_used = [
-            feedback_list[i] is not None and (not feedback_only_without_solution or solution_strs[i] is None)
-            for i in range(batch_size)
-        ]
+        # Every sample participates in self-distillation -- reward is not a
+        # training signal anywhere on this loss path (see
+        # compute_self_distillation_loss, which never takes advantages/reward as
+        # input), so there's nothing meaningful left to gate inclusion on.
+        self_distillation_mask = torch.ones(batch_size, dtype=torch.float32, device=device)
 
-        # self_distillation_mask is True if sample has a solution OR feedback is used (i.e., will get a reprompted message)
-        self_distillation_mask = torch.tensor(
-            [solution_strs[i] is not None or feedback_used[i] for i in range(batch_size)],
-            dtype=torch.float32,
-            device=device
-        )
-
-        uids = set(batch.non_tensor_batch["uid"])
-        num_with_feedback_available = sum(1 for f in feedback_list if f is not None)
-        num_with_feedback_used = sum(1 for f in feedback_used if f)
-        num_with_solution = sum(1 for s in solution_strs if s is not None)
+        num_with_goal_context = sum(1 for g in goal_contexts if g)
         metrics = {
-            "self_distillation/success_group_fraction": len([uid for uid in uids if len(success_by_uid[uid]) > 0]) / len(uids),
-            "self_distillation/success_sample_fraction": num_with_solution / batch_size,
-            "self_distillation/feedback_available_fraction": num_with_feedback_available / batch_size,
-            "self_distillation/feedback_used_fraction": num_with_feedback_used / batch_size,
+            "self_distillation/goal_context_available_fraction": num_with_goal_context / batch_size,
             "self_distillation/reprompt_sample_fraction": self_distillation_mask.float().mean().item(),
         }
         return DataProto.from_dict(tensors={
@@ -1784,7 +1684,7 @@ class RayPPOTrainer:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         batch.batch["token_level_scores"] = reward_tensor
 
-                        self_distillation_data = self._maybe_build_self_distillation_batch(batch, reward_tensor, reward_extra_infos_dict)
+                        self_distillation_data = self._maybe_build_self_distillation_batch(batch)
                         if self_distillation_data is not None:
                             self_distillation_batch, self_distillation_metrics = self_distillation_data
                             batch = batch.union(self_distillation_batch)
